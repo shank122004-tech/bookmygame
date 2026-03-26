@@ -5496,7 +5496,7 @@ async function viewGround(groundId) {
         // Try to get venue information if this ground belongs to a venue owner
         let venueInfo = null;
         let groundAddress = '';
-        groundImages: item.images || []
+        
         if (!isPlotOwner) {
             // For venue owners, try to get venue details
             const venueSnapshot = await db.collection(COLLECTIONS.VENUES)
