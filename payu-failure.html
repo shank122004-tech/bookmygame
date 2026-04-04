@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Payment Failed - BookMyGame</title>
+    <script>
+        const urlParams = new URLSearchParams(window.location.search);
+        const txnId = urlParams.get('txnid');
+        const errorMsg = urlParams.get('error');
+        
+        if (txnId) {
+            localStorage.setItem('payuPaymentResult', JSON.stringify({
+                success: false,
+                txnId: txnId,
+                error: errorMsg || 'Payment failed'
+            }));
+        }
+        window.location.href = '/index.html';
+    </script>
+</head>
+<body>
+    <div style="text-align: center; padding: 50px;">
+        <h2>Processing Payment Failure...</h2>
+        <div class="loader"></div>
+    </div>
+</body>
+</html>
