@@ -54,7 +54,7 @@
 // ─────────────────────────────────────────────
 
 const PAYMENT_CFG = {
- CREATE_ORDER_URL: "https://us-central1-bookmygame-2149d.cloudfunctions.net/createOrder",
+ CREATE_ORDER_URL: "https://createorder-zcufrrpotq-uc.a.run.app",
   CASHFREE_MODE       : "production",         // "sandbox" | "production"
   LISTENER_TIMEOUT_MS : 30 * 1000,        // 30s wait; poll fallback fires after this
   SLOT_LOCK_DURATION_MS: 15 * 60 * 1000,      // slot held for 15 min
