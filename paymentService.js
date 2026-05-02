@@ -649,15 +649,23 @@ function openCashfreePopup(paymentSessionId, orderId, paymentType, data, trigger
         startPayment(data, paymentType);
       });
     },
-    onClose: () => {
-      // User closed popup without completing payment.
-      // The Firestore listener stays active for 3 min in case the payment
-      // went through at the bank level before the popup closed.
-      // We update the message so the user sees something meaningful.
-      // The focus handler (Fix 3) will clean up if they leave and come back
-      // without a webhook firing.
-      updatePaymentLoadingMsg("Waiting for payment confirmation…");
-    },
+    onClose: async () => {
+  console.log("Popup closed");
+
+  setTimeout(async () => {
+    if (localStorage.getItem(LS.IN_PROGRESS) === "true") {
+      console.log("No payment detected → cancelling");
+
+      clearPaymentState();
+      _paymentInFlight = false;
+
+      await releaseSlotLock(orderId);
+
+      removePaymentUI();
+      showToast("Payment cancelled", "warning");
+    }
+  }, 3000); // wait 3 sec for webhook chance
+}
   });
 }
 
