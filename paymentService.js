@@ -67,6 +67,7 @@ const LS = {
   PAY_TYPE   : "bmg_payType",
   PAY_DATA   : "bmg_payData",
   IN_PROGRESS: "bmg_payInProgress",
+  CANCELLED  : "bmg_payCancelled",   // written on cancel/close; cleared on success
 };
 
 // ─────────────────────────────────────────────
@@ -75,13 +76,6 @@ const LS = {
 // Prevents startPayment() from running concurrently.
 // Any second call while one is in-flight is silently dropped.
 let _paymentInFlight = false;
-
-// [FIX 4] If bmg_payInProgress is set but there is no orderId, the flag is
-// orphaned (e.g. browser was hard-killed mid-flow). Clear it immediately so
-// the UI never shows a stuck "Checking payment status…" on a fresh load.
-if (!localStorage.getItem(LS.ORDER_ID)) {
-  localStorage.removeItem(LS.IN_PROGRESS);
-}
 
 // ─────────────────────────────────────────────
 // HELPERS
@@ -93,6 +87,14 @@ function generateOrderId(prefix = "ORD") {
 
 function clearPaymentState() {
   Object.values(LS).forEach(k => localStorage.removeItem(k));
+}
+
+// Written immediately when user cancels/closes the popup.
+// recoverPaymentSession() reads this on the next page load and skips the
+// "Checking payment status…" overlay, showing a cancelled toast instead.
+function cancelPaymentState(orderId) {
+  localStorage.setItem(LS.CANCELLED, orderId || "1");
+  Object.values(LS).filter(k => k !== LS.CANCELLED).forEach(k => localStorage.removeItem(k));
 }
 
 function savePaymentState(orderId, paymentType, data) {
@@ -270,34 +272,6 @@ function _registerPageUnloadCleanup() {
 }
 
 _registerPageUnloadCleanup();
-
-// [FIX 3] When the user returns to the tab (e.g. after closing the Cashfree
-// popup in a separate tab or being redirected back), check if a payment was
-// marked in-progress but no Firestore listener is actively waiting.
-// If so, the popup was dismissed without completing — clear the stuck UI.
-//
-// IMPORTANT: We check _activeListener first. If it's set, a real Firestore
-// listener is running (webhook may still fire) — do NOT interrupt it.
-// Only clear state when the listener is gone but the flag is still set,
-// which is the stuck-UI scenario.
-window.addEventListener("focus", () => {
-  const inProgress = localStorage.getItem(LS.IN_PROGRESS);
-  if (inProgress !== "true") return;
-
-  if (_activeListener) {
-    // A Firestore listener is still live — payment may genuinely be processing.
-    // Update the message so the user knows what's happening, but don't reset.
-    updatePaymentLoadingMsg("Waiting for payment confirmation…");
-    return;
-  }
-
-  // No active listener + flag still set = popup was closed without completion
-  // and nothing is waiting for the webhook. Safe to reset.
-  console.log("👁 User returned to tab with no active listener — clearing stuck state.");
-  clearPaymentState();
-  _paymentInFlight = false;
-  removePaymentUI();
-});
 
 /**
  * listenForPaymentConfirmation()
@@ -637,8 +611,8 @@ function openCashfreePopup(paymentSessionId, orderId, paymentType, data, trigger
       // [U13] Release in-flight lock so user can try again without refreshing
       _paymentInFlight = false;
       reEnableButton(triggerBtn);
-      clearPaymentState();
       _clearActiveListener();
+      cancelPaymentState(orderId); // marks cancelled so refresh skips the spinner
 
       console.warn("Cashfree reported popup failure:", reason);
 
@@ -646,26 +620,41 @@ function openCashfreePopup(paymentSessionId, orderId, paymentType, data, trigger
       await releaseSlotLock(orderId);
 
       showPaymentError("Payment was not completed. Please try again.", () => {
+        // Clear the cancelled flag before retrying so recovery works if they refresh
+        localStorage.removeItem(LS.CANCELLED);
         startPayment(data, paymentType);
       });
     },
-    onClose: async () => {
-  console.log("Popup closed");
-
-  setTimeout(async () => {
-    if (localStorage.getItem(LS.IN_PROGRESS) === "true") {
-      console.log("No payment detected → cancelling");
-
-      clearPaymentState();
+    onClose: () => {
+      // User closed/cancelled the popup.
+      // Kill the Firestore listener immediately — we are NOT waiting for a
+      // webhook because no payment was submitted.
+      _clearActiveListener();
       _paymentInFlight = false;
+      reEnableButton(triggerBtn);
 
-      await releaseSlotLock(orderId);
+      // Mark as cancelled BEFORE touching the overlay so that if the user
+      // refreshes in the next 2 seconds the recovery flow skips the spinner.
+      cancelPaymentState(orderId);
 
-      removePaymentUI();
-      showToast("Payment cancelled", "warning");
-    }
-  }, 3000); // wait 3 sec for webhook chance
-}
+      // Release the slot lock in the background (don't await — fire and forget)
+      releaseSlotLock(orderId).catch(e => console.warn("releaseSlotLock:", e));
+
+      // Give the user 2 seconds to see "Payment Cancelled" then remove the overlay.
+      const card = document.querySelector("._bmg_pay_card");
+      if (card) {
+        card.innerHTML = `
+          <div class="_bmg_error_icon">✗</div>
+          <h3 style="color:#ef4444">Payment Cancelled</h3>
+          <p>You cancelled the payment. Your slot has been released.</p>
+          <button class="_bmg_retry_btn" onclick="removePaymentUI()">OK</button>
+        `;
+      }
+      setTimeout(() => {
+        removePaymentUI();
+        showToast("Payment cancelled. Select a slot to try again.", "warning", 4000);
+      }, 2000);
+    },
   });
 }
 
@@ -946,57 +935,40 @@ function dispatchPaymentEvent(name, detail) {
 // ─────────────────────────────────────────────
 
 function recoverPaymentSession() {
-  // [FIX 1] Check URL params first — Cashfree appends these on cancel/failure
-  // even in popup mode on some Android webviews / redirected flows.
-  const params = new URLSearchParams(window.location.search);
-  const urlStatus = (params.get("payment_status") || params.get("txStatus") || "").toUpperCase();
-
-  if (urlStatus === "FAILED" || urlStatus === "CANCELLED" || urlStatus === "CANCEL") {
-    console.log("💳 Payment cancelled/failed via URL param — clearing state.");
-    clearPaymentState();
-    _paymentInFlight = false;
-    removePaymentUI();
-    showToast("Payment cancelled. You can try again anytime.", "warning", 5000);
-    // Strip the params so a refresh doesn't re-trigger this branch
-    window.history.replaceState({}, "", window.location.pathname);
+  // ── GUARD 1: Previous session was explicitly cancelled/closed ────────────
+  // cancelPaymentState() sets bmg_payCancelled when user dismisses the popup.
+  // On refresh we clear it silently — never show the spinner for a cancel.
+  if (localStorage.getItem(LS.CANCELLED)) {
+    console.log("⚡ Previous payment was cancelled — skipping recovery.");
+    localStorage.removeItem(LS.CANCELLED); // one-shot: clear so it doesn't persist
     return;
   }
 
+  // ── GUARD 2: Orphaned flag — IN_PROGRESS set but no orderId saved ───────
+  // Happens when the browser was hard-killed before savePaymentState() ran.
+  const orderId = localStorage.getItem(LS.ORDER_ID);
+  const payType = localStorage.getItem(LS.PAY_TYPE);
+  if (!orderId || !payType) {
+    localStorage.removeItem(LS.IN_PROGRESS);
+    return;
+  }
+
+  // ── GUARD 3: IN_PROGRESS must actually be "true" ─────────────────────────
   const inProgress = localStorage.getItem(LS.IN_PROGRESS);
-  const orderId    = localStorage.getItem(LS.ORDER_ID);
-  const payType    = localStorage.getItem(LS.PAY_TYPE);
+  if (inProgress !== "true") return;
 
-  if (inProgress !== "true" || !orderId || !payType) return;
-
+  // ── Real mid-payment refresh — check Firestore for webhook result ─────────
   console.log("🔁 Recovering payment session:", orderId, payType);
   showPaymentLoading("Checking payment status…");
 
-  // [FIX 2] Hard failsafe: if the Firestore listener hasn't resolved within
-  // 5 minutes of page load, assume the payment was abandoned and reset.
-  // This is a last-resort guard — the listener's own 3-min onTimeout fires first
-  // in the normal flow. This catches the edge case where the listener itself
-  // never attaches (e.g. Firestore offline, permissions error on recovery).
-  const _recoveryFailsafe = setTimeout(() => {
-    if (localStorage.getItem(LS.IN_PROGRESS) === "true") {
-      console.warn("⏰ Recovery failsafe triggered — clearing stuck payment state.");
-      clearPaymentState();
-      _paymentInFlight = false;
-      _clearActiveListener();
-      removePaymentUI();
-      showToast("Payment session expired. Please try again.", "error", 7000);
-    }
-  }, 5 * 60 * 1000); // 5 min — fires only if listener onTimeout didn't already clean up
-
   listenForPaymentConfirmation(orderId, payType, {
     onConfirmed: (result) => {
-      clearTimeout(_recoveryFailsafe);
       clearPaymentState();
       _paymentInFlight = false;
       showPaymentSuccess(payType, orderId);
       dispatchPaymentEvent("bmg:paymentConfirmed", { orderId, paymentType: payType, result });
     },
     onTimeout: async () => {
-      clearTimeout(_recoveryFailsafe);
       removePaymentUI();
       clearPaymentState();
       _paymentInFlight = false;
