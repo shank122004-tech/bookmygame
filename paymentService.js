@@ -56,7 +56,7 @@
 const PAYMENT_CFG = {
  CREATE_ORDER_URL: "https://us-central1-bookmygame-2149d.cloudfunctions.net/createOrder",
   CASHFREE_MODE       : "production",         // "sandbox" | "production"
-  LISTENER_TIMEOUT_MS : 3 * 60 * 1000,        // 3 min max wait for webhook
+  LISTENER_TIMEOUT_MS : 30 * 1000,        // 30s wait; poll fallback fires after this
   SLOT_LOCK_DURATION_MS: 15 * 60 * 1000,      // slot held for 15 min
   PENDING_EXPIRY_MS   : 30 * 60 * 1000,       // pending doc TTL
   OWNER_ONBOARDING_FEE: 499,
@@ -274,6 +274,37 @@ function _registerPageUnloadCleanup() {
 _registerPageUnloadCleanup();
 
 /**
+ * pollCashfreeOrderStatus()
+ *
+ * FALLBACK: Called when the Firestore listener times out (webhook delayed or
+ * failed). Hits the backend /checkOrderStatus endpoint which re-queries
+ * Cashfree directly and, if paid, triggers the same Firestore writes the
+ * webhook would have done.
+ *
+ * This guarantees the booking is confirmed even if:
+ *   - The Cashfree webhook was delayed / missed
+ *   - The user returned from payment to the app before the webhook fired
+ *   - Network issues prevented the Firestore listener from seeing the deletion
+ */
+async function pollCashfreeOrderStatus(orderId, paymentType) {
+  try {
+    updatePaymentLoadingMsg("Verifying payment directly…");
+    const res = await fetch("https://us-central1-bookmygame-2149d.cloudfunctions.net/checkOrderStatus", {
+      method : "POST",
+      headers: { "Content-Type": "application/json" },
+      body   : JSON.stringify({ orderId, paymentType }),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data; // { status: "SUCCESS"|"FAILED"|"PENDING", booking?: {...} }
+  } catch (e) {
+    console.warn("pollCashfreeOrderStatus error:", e);
+    return null;
+  }
+}
+
+
+/**
  * listenForPaymentConfirmation()
  *
  * Attaches a Firestore onSnapshot listener to pending_payments/{orderId}.
@@ -293,9 +324,33 @@ function listenForPaymentConfirmation(orderId, paymentType, callbacks) {
   // [U9] Always cancel any prior listener before starting a new one
   _clearActiveListener();
 
-  // Set timeout — if webhook never fires within the window, surface a warning
-  _listenerTimer = setTimeout(() => {
+  // Set timeout — if webhook never fires within the window, try a direct poll
+  // before giving up. This handles: delayed webhooks, user returning from
+  // payment page before webhook fires, and network-related listener gaps.
+  _listenerTimer = setTimeout(async () => {
     _clearActiveListener();
+
+    // ── FALLBACK: poll Cashfree directly via backend ──────────────────
+    // Before calling onTimeout (which shows a warning and releases the slot),
+    // ask the backend to re-check Cashfree. If paid, trigger onConfirmed.
+    try {
+      const pollResult = await pollCashfreeOrderStatus(orderId, paymentType);
+      if (pollResult?.status === "SUCCESS") {
+        console.log("✅ [FALLBACK POLL] Payment confirmed via direct check:", orderId);
+        onConfirmed(pollResult.booking || { orderId, paymentType });
+        return;
+      }
+      if (pollResult?.status === "FAILED") {
+        showPaymentError("Payment failed. Please try again.");
+        clearPaymentState();
+        _paymentInFlight = false;
+        return;
+      }
+      // PENDING or null — genuinely unknown, fall through to onTimeout
+    } catch (e) {
+      console.warn("[FALLBACK POLL] Error:", e);
+    }
+
     onTimeout(orderId);
   }, PAYMENT_CFG.LISTENER_TIMEOUT_MS);
 
@@ -994,34 +1049,83 @@ function recoverPaymentSession() {
   console.log("🔁 Recovering payment session:", orderId, payType);
   showPaymentLoading("Checking payment status…");
 
-  // Safety: if Firestore doesn't respond within 2 seconds and the payment
-  // was already cancelled, dismiss the overlay automatically.
-  const _recoveryGuard = setTimeout(() => {
-    if (localStorage.getItem(LS.CANCELLED)) {
-      localStorage.removeItem(LS.CANCELLED);
-      _clearActiveListener();
-      removePaymentUI();
-      clearPaymentState();
-    }
-  }, 2000);
+  // FIX: Check if the pending doc STILL EXISTS before starting the long listener.
+  // When the user returns from the Cashfree page the webhook may have already
+  // fired and deleted pending_payments. In that case we should read the final
+  // doc immediately rather than waiting 30 s for the listener to time out.
+  (async () => {
+    // Safety: if the page was cancelled and the flag wasn't cleared, dismiss quickly.
+    const _cancelGuard = setTimeout(() => {
+      if (localStorage.getItem(LS.CANCELLED)) {
+        localStorage.removeItem(LS.CANCELLED);
+        _clearActiveListener();
+        removePaymentUI();
+        clearPaymentState();
+      }
+    }, 2000);
 
-  listenForPaymentConfirmation(orderId, payType, {
-    onConfirmed: (result) => {
-      clearTimeout(_recoveryGuard);
-      clearPaymentState();
-      _paymentInFlight = false;
-      showPaymentSuccess(payType, orderId);
-      dispatchPaymentEvent("bmg:paymentConfirmed", { orderId, paymentType: payType, result });
-    },
-    onTimeout: async () => {
-      clearTimeout(_recoveryGuard);
-      removePaymentUI();
-      clearPaymentState();
-      _paymentInFlight = false;
-      await releaseSlotLock(orderId);
-      showToast("Could not verify payment automatically. Check your booking history.", "warning", 8000);
-    },
-  });
+    try {
+      const pendingSnap = await db.collection("pending_payments").doc(orderId).get();
+
+      if (!pendingSnap.exists) {
+        // Pending doc already gone — webhook fired while we were away.
+        // Check whether it's a success or failure directly.
+        clearTimeout(_cancelGuard);
+        updatePaymentLoadingMsg("Verifying booking…");
+
+        const failSnap = await db.collection("failed_payments").doc(orderId).get();
+        if (failSnap.exists) {
+          clearPaymentState();
+          _paymentInFlight = false;
+          showPaymentError(failSnap.data()?.failureReason || "Payment failed. Please try again.");
+          return;
+        }
+
+        // Check final collections for success
+        let result = null;
+        if (payType === "booking") {
+          const bSnap = await db.collection("bookings").doc(orderId).get();
+          if (bSnap.exists) result = bSnap.data();
+        } else if (payType === "tournament") {
+          const tSnap = await db.collection("tournament_entries").doc(orderId).get();
+          if (tSnap.exists) result = tSnap.data();
+        } else if (payType === "owner_onboarding") {
+          result = { orderId, paymentType: payType };
+        }
+
+        if (result) {
+          clearPaymentState();
+          _paymentInFlight = false;
+          showPaymentSuccess(payType, orderId);
+          dispatchPaymentEvent("bmg:paymentConfirmed", { orderId, paymentType: payType, result });
+          return;
+        }
+
+        // Final docs not found yet — webhook may be in-flight. Start listener.
+        console.log("⏳ Pending gone but no final doc yet — starting listener for late webhook.");
+      }
+    } catch (e) {
+      console.warn("recoverPaymentSession pre-check error:", e);
+      clearTimeout(_cancelGuard);
+    }
+
+    // Standard listener path — pending doc exists (or pre-check failed), wait for webhook.
+    listenForPaymentConfirmation(orderId, payType, {
+      onConfirmed: (result) => {
+        clearPaymentState();
+        _paymentInFlight = false;
+        showPaymentSuccess(payType, orderId);
+        dispatchPaymentEvent("bmg:paymentConfirmed", { orderId, paymentType: payType, result });
+      },
+      onTimeout: async () => {
+        removePaymentUI();
+        clearPaymentState();
+        _paymentInFlight = false;
+        await releaseSlotLock(orderId);
+        showToast("Could not verify payment automatically. Check your booking history.", "warning", 8000);
+      },
+    });
+  })();
 }
 
 document.addEventListener("DOMContentLoaded", recoverPaymentSession);
