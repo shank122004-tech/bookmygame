@@ -634,13 +634,13 @@ function openCashfreePopup(paymentSessionId, orderId, paymentType, data, trigger
       reEnableButton(triggerBtn);
 
       // Mark as cancelled BEFORE touching the overlay so that if the user
-      // refreshes in the next 2 seconds the recovery flow skips the spinner.
+      // refreshes the recovery flow skips the spinner.
       cancelPaymentState(orderId);
 
       // Release the slot lock in the background (don't await — fire and forget)
       releaseSlotLock(orderId).catch(e => console.warn("releaseSlotLock:", e));
 
-      // Give the user 2 seconds to see "Payment Cancelled" then remove the overlay.
+      // Show "Payment Cancelled" for exactly 2 seconds, then dismiss.
       const card = document.querySelector("._bmg_pay_card");
       if (card) {
         card.innerHTML = `
@@ -650,12 +650,42 @@ function openCashfreePopup(paymentSessionId, orderId, paymentType, data, trigger
           <button class="_bmg_retry_btn" onclick="removePaymentUI()">OK</button>
         `;
       }
+      // Hard 2-second dismiss — overlay will never get stuck
       setTimeout(() => {
         removePaymentUI();
         showToast("Payment cancelled. Select a slot to try again.", "warning", 4000);
       }, 2000);
     },
   });
+
+  // ── Safety net: if Cashfree never fires onClose/onFailure (browser quirk),
+  //    auto-dismiss the "Securing Payment" overlay after 2 s once popup is open.
+  //    We only dismiss if the overlay is still in "Securing / Opening" state
+  //    (i.e. user hasn't paid yet). A short 500 ms delay lets the popup render first.
+  setTimeout(() => {
+    if (_paymentInFlight) return; // payment already completed/failed — skip
+    // If overlay still shows the initial spinner message, it means onClose was
+    // never called. Treat it as a cancel.
+    const msgEl = document.getElementById("_bmg_pay_msg");
+    if (msgEl && (
+      msgEl.textContent.includes("Securing") ||
+      msgEl.textContent.includes("Opening") ||
+      msgEl.textContent.includes("Creating")
+    )) {
+      // Don't remove yet — popup may still be legitimately open.
+      // Set a 2-second watchdog that fires IF the popup is dismissed but overlay stays.
+      let _cancelWatchdog = setInterval(() => {
+        const overlay = document.getElementById("_bmg_pay_overlay");
+        if (!overlay) { clearInterval(_cancelWatchdog); return; } // already gone
+        if (_paymentInFlight) { clearInterval(_cancelWatchdog); return; } // in progress
+        // Overlay still showing but no payment in flight → stuck. Dismiss now.
+        clearInterval(_cancelWatchdog);
+        cancelPaymentState(orderId);
+        removePaymentUI();
+        showToast("Payment cancelled. Select a slot to try again.", "warning", 4000);
+      }, 2000);
+    }
+  }, 500);
 }
 
 // ─────────────────────────────────────────────
@@ -941,6 +971,9 @@ function recoverPaymentSession() {
   if (localStorage.getItem(LS.CANCELLED)) {
     console.log("⚡ Previous payment was cancelled — skipping recovery.");
     localStorage.removeItem(LS.CANCELLED); // one-shot: clear so it doesn't persist
+    // Also remove any stuck overlay immediately (2-second max)
+    removePaymentUI();
+    setTimeout(removePaymentUI, 2000); // belt-and-suspenders
     return;
   }
 
@@ -961,14 +994,27 @@ function recoverPaymentSession() {
   console.log("🔁 Recovering payment session:", orderId, payType);
   showPaymentLoading("Checking payment status…");
 
+  // Safety: if Firestore doesn't respond within 2 seconds and the payment
+  // was already cancelled, dismiss the overlay automatically.
+  const _recoveryGuard = setTimeout(() => {
+    if (localStorage.getItem(LS.CANCELLED)) {
+      localStorage.removeItem(LS.CANCELLED);
+      _clearActiveListener();
+      removePaymentUI();
+      clearPaymentState();
+    }
+  }, 2000);
+
   listenForPaymentConfirmation(orderId, payType, {
     onConfirmed: (result) => {
+      clearTimeout(_recoveryGuard);
       clearPaymentState();
       _paymentInFlight = false;
       showPaymentSuccess(payType, orderId);
       dispatchPaymentEvent("bmg:paymentConfirmed", { orderId, paymentType: payType, result });
     },
     onTimeout: async () => {
+      clearTimeout(_recoveryGuard);
       removePaymentUI();
       clearPaymentState();
       _paymentInFlight = false;
