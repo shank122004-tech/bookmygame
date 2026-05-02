@@ -100,7 +100,7 @@ function cancelPaymentState(orderId) {
 function savePaymentState(orderId, paymentType, data) {
   localStorage.setItem(LS.ORDER_ID,    orderId);
   localStorage.setItem(LS.PAY_TYPE,    paymentType);
-  localStorage.setItem(LS.PAY_DATA,    JSON.stringify(data));
+  localStorage.setItem(LS.PAY_DATA,    JSON.stringify({ ...data, _savedAt: Date.now() }));
   localStorage.setItem(LS.IN_PROGRESS, "true");
 }
 
@@ -634,13 +634,13 @@ function openCashfreePopup(paymentSessionId, orderId, paymentType, data, trigger
       reEnableButton(triggerBtn);
 
       // Mark as cancelled BEFORE touching the overlay so that if the user
-      // refreshes the recovery flow skips the spinner.
+      // refreshes in the next 2 seconds the recovery flow skips the spinner.
       cancelPaymentState(orderId);
 
       // Release the slot lock in the background (don't await — fire and forget)
       releaseSlotLock(orderId).catch(e => console.warn("releaseSlotLock:", e));
 
-      // Show "Payment Cancelled" for exactly 2 seconds, then dismiss.
+      // Give the user 2 seconds to see "Payment Cancelled" then remove the overlay.
       const card = document.querySelector("._bmg_pay_card");
       if (card) {
         card.innerHTML = `
@@ -650,42 +650,12 @@ function openCashfreePopup(paymentSessionId, orderId, paymentType, data, trigger
           <button class="_bmg_retry_btn" onclick="removePaymentUI()">OK</button>
         `;
       }
-      // Hard 2-second dismiss — overlay will never get stuck
       setTimeout(() => {
         removePaymentUI();
         showToast("Payment cancelled. Select a slot to try again.", "warning", 4000);
       }, 2000);
     },
   });
-
-  // ── Safety net: if Cashfree never fires onClose/onFailure (browser quirk),
-  //    auto-dismiss the "Securing Payment" overlay after 2 s once popup is open.
-  //    We only dismiss if the overlay is still in "Securing / Opening" state
-  //    (i.e. user hasn't paid yet). A short 500 ms delay lets the popup render first.
-  setTimeout(() => {
-    if (_paymentInFlight) return; // payment already completed/failed — skip
-    // If overlay still shows the initial spinner message, it means onClose was
-    // never called. Treat it as a cancel.
-    const msgEl = document.getElementById("_bmg_pay_msg");
-    if (msgEl && (
-      msgEl.textContent.includes("Securing") ||
-      msgEl.textContent.includes("Opening") ||
-      msgEl.textContent.includes("Creating")
-    )) {
-      // Don't remove yet — popup may still be legitimately open.
-      // Set a 2-second watchdog that fires IF the popup is dismissed but overlay stays.
-      let _cancelWatchdog = setInterval(() => {
-        const overlay = document.getElementById("_bmg_pay_overlay");
-        if (!overlay) { clearInterval(_cancelWatchdog); return; } // already gone
-        if (_paymentInFlight) { clearInterval(_cancelWatchdog); return; } // in progress
-        // Overlay still showing but no payment in flight → stuck. Dismiss now.
-        clearInterval(_cancelWatchdog);
-        cancelPaymentState(orderId);
-        removePaymentUI();
-        showToast("Payment cancelled. Select a slot to try again.", "warning", 4000);
-      }, 2000);
-    }
-  }, 500);
 }
 
 // ─────────────────────────────────────────────
@@ -966,55 +936,78 @@ function dispatchPaymentEvent(name, detail) {
 
 function recoverPaymentSession() {
   // ── GUARD 1: Previous session was explicitly cancelled/closed ────────────
-  // cancelPaymentState() sets bmg_payCancelled when user dismisses the popup.
-  // On refresh we clear it silently — never show the spinner for a cancel.
   if (localStorage.getItem(LS.CANCELLED)) {
     console.log("⚡ Previous payment was cancelled — skipping recovery.");
-    localStorage.removeItem(LS.CANCELLED); // one-shot: clear so it doesn't persist
-    // Also remove any stuck overlay immediately (2-second max)
+    clearPaymentState();
     removePaymentUI();
-    setTimeout(removePaymentUI, 2000); // belt-and-suspenders
     return;
   }
 
   // ── GUARD 2: Orphaned flag — IN_PROGRESS set but no orderId saved ───────
-  // Happens when the browser was hard-killed before savePaymentState() ran.
   const orderId = localStorage.getItem(LS.ORDER_ID);
   const payType = localStorage.getItem(LS.PAY_TYPE);
   if (!orderId || !payType) {
-    localStorage.removeItem(LS.IN_PROGRESS);
+    clearPaymentState();
     return;
   }
 
   // ── GUARD 3: IN_PROGRESS must actually be "true" ─────────────────────────
   const inProgress = localStorage.getItem(LS.IN_PROGRESS);
-  if (inProgress !== "true") return;
+  if (inProgress !== "true") {
+    clearPaymentState();
+    return;
+  }
+
+  // ── GUARD 4: Stale session — if the pending payment is older than 30 min, ──
+  // clear it immediately. No point showing a spinner for a dead session.
+  const savedData = localStorage.getItem(LS.PAY_DATA);
+  if (savedData) {
+    try {
+      const parsed = JSON.parse(savedData);
+      const savedAt = parsed._savedAt || 0;
+      if (savedAt && (Date.now() - savedAt) > 30 * 60 * 1000) {
+        console.log("⚡ Stale payment session (>30 min) — clearing.");
+        clearPaymentState();
+        return;
+      }
+    } catch(e) { /* ignore parse errors */ }
+  }
 
   // ── Real mid-payment refresh — check Firestore for webhook result ─────────
   console.log("🔁 Recovering payment session:", orderId, payType);
   showPaymentLoading("Checking payment status…");
 
-  // Safety: if Firestore doesn't respond within 2 seconds and the payment
-  // was already cancelled, dismiss the overlay automatically.
-  const _recoveryGuard = setTimeout(() => {
-    if (localStorage.getItem(LS.CANCELLED)) {
-      localStorage.removeItem(LS.CANCELLED);
+  // ── HARD 2-SECOND AUTO-DISMISS ────────────────────────────────────────────
+  // If the overlay is still showing "Checking payment status..." after 2 s,
+  // it means either:
+  //   (a) the payment was cancelled and the flag wasn't saved (app killed mid-flow)
+  //   (b) Firestore hasn't responded yet
+  // In both cases — dismiss immediately and let the user try again.
+  // If the webhook DOES confirm after this, the bmg:paymentConfirmed event
+  // will still fire and update the UI correctly.
+  const _autoDismiss = setTimeout(() => {
+    const msgEl = document.getElementById("_bmg_pay_msg");
+    const isStillChecking = msgEl && msgEl.textContent.includes("Checking");
+    if (isStillChecking) {
+      console.log("⚡ Auto-dismissing stuck 'Checking payment status' overlay.");
       _clearActiveListener();
-      removePaymentUI();
       clearPaymentState();
+      _paymentInFlight = false;
+      removePaymentUI();
+      // Don't show error toast — this is likely just a cancelled payment
     }
   }, 2000);
 
   listenForPaymentConfirmation(orderId, payType, {
     onConfirmed: (result) => {
-      clearTimeout(_recoveryGuard);
+      clearTimeout(_autoDismiss);
       clearPaymentState();
       _paymentInFlight = false;
       showPaymentSuccess(payType, orderId);
       dispatchPaymentEvent("bmg:paymentConfirmed", { orderId, paymentType: payType, result });
     },
     onTimeout: async () => {
-      clearTimeout(_recoveryGuard);
+      clearTimeout(_autoDismiss);
       removePaymentUI();
       clearPaymentState();
       _paymentInFlight = false;
@@ -1023,6 +1016,23 @@ function recoverPaymentSession() {
     },
   });
 }
+
+// Also: on every page load, nuke any leftover IN_PROGRESS flag that is older
+// than 35 minutes — this is the final safety net for truly orphaned sessions.
+(function clearStalePaymentFlags() {
+  const savedData = localStorage.getItem(LS.PAY_DATA);
+  if (!savedData) return;
+  try {
+    const parsed = JSON.parse(savedData);
+    const savedAt = parsed._savedAt || 0;
+    if (savedAt && (Date.now() - savedAt) > 35 * 60 * 1000) {
+      clearPaymentState();
+    }
+  } catch(e) {
+    // Unparseable data = definitely stale
+    clearPaymentState();
+  }
+})();
 
 document.addEventListener("DOMContentLoaded", recoverPaymentSession);
 
@@ -1036,3 +1046,18 @@ window.initiateOwnerOnboardingPayment = initiateOwnerOnboardingPayment;
 window.initiateTournamentPayment      = initiateTournamentPayment;
 window.releaseSlotLock                = releaseSlotLock;
 window.removePaymentUI                = removePaymentUI;
+window.clearPaymentState              = clearPaymentState;
+window.cancelPaymentState             = cancelPaymentState;
+
+// ── EMERGENCY CLEAR: If user lands on the page with no active payment
+//    but old localStorage flags are set, wipe them after 2 seconds.
+//    This is the last-resort fix for the stuck "Securing Payment" screen.
+setTimeout(() => {
+  if (_paymentInFlight) return; // real payment happening — don't touch
+  const hasStaleFlag = localStorage.getItem(LS.IN_PROGRESS) === "true";
+  if (hasStaleFlag) {
+    console.log("⚡ [Emergency] Clearing stale payment flags on idle page load.");
+    clearPaymentState();
+    removePaymentUI();
+  }
+}, 2000);
