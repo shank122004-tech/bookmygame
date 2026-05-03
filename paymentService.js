@@ -509,6 +509,12 @@ window.recoverPaymentSession              = recoverPaymentSession;
       setTimeout(() => {
         _groundUpdateStep(1);
         _wireGroundNavButtons();
+        // Re-initialise image upload so the file input has a fresh change listener.
+        // initializeImageUpload is defined in app.js and exposed to window; calling it
+        // here covers the case where the patched wrapper is what actually opens the modal.
+        if (typeof window.initializeImageUpload === 'function') {
+          window.initializeImageUpload();
+        }
       }, 60);
     };
   }
@@ -705,21 +711,7 @@ window.recoverPaymentSession              = recoverPaymentSession;
       _injectTField(step3, 'tournament-prize',     'text',     'Prize Pool / Trophy',   'e.g. ₹10,000 + Trophy');
       _injectTField(step3, 'tournament-rules',     'textarea', 'Rules & Regulations',   'Any specific rules…');
     }
-    const step4 = form.querySelector('.form-step[data-step="4"]');
-    if (step4 && !step4.querySelector('.tournament-review-panel')) {
-      step4.innerHTML = `
-        <div class="tournament-review-panel">
-          <h4 style="margin-bottom:12px;"><i class="fas fa-eye"></i> Review Your Tournament</h4>
-          <div id="tournament-preview-details"
-               style="background:var(--bg-secondary,#f5f5f5);border-radius:12px;padding:16px;font-size:13px;">
-            Please go back and fill in all details before submitting.
-          </div>
-          <div style="margin-top:14px;padding:12px;background:#fff3cd;border-radius:8px;font-size:12px;">
-            <i class="fas fa-info-circle" style="color:#f59e0b;"></i>
-            Entry fees will show in your earnings as participants register.
-          </div>
-        </div>`;
-    }
+    // Step 4 is the Contact Info step — its fields are already in the HTML, do not replace them.
     // Wire preview updater
     const nextBtn = document.getElementById('tournament-next-btn');
     if (nextBtn && !nextBtn.dataset.previewWired) {
