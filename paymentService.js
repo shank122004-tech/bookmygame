@@ -56,7 +56,7 @@
 const PAYMENT_CFG = {
  CREATE_ORDER_URL: "https://createorder-zcufrrpotq-uc.a.run.app",
   CASHFREE_MODE       : "production",         // "sandbox" | "production"
-  LISTENER_TIMEOUT_MS : 30 * 1000,        // 30s wait; poll fallback fires after this
+  LISTENER_TIMEOUT_MS : 90 * 1000,        // 90s wait; poll fallback fires after this
   SLOT_LOCK_DURATION_MS: 15 * 60 * 1000,      // slot held for 15 min
   PENDING_EXPIRY_MS   : 30 * 60 * 1000,       // pending doc TTL
   OWNER_ONBOARDING_FEE: 499,
@@ -75,7 +75,11 @@ const LS = {
 // ─────────────────────────────────────────────
 // Prevents startPayment() from running concurrently.
 // Any second call while one is in-flight is silently dropped.
-let _paymentInFlight = false;
+let _paymentInFlight  = false;
+// Tracks whether the user actually submitted a payment in the Cashfree popup.
+// Set to true in onSuccess so onClose knows NOT to cancel the listener
+// (covers UPI app-switch flows where the popup closes after payment is sent).
+let _paymentSubmitted = false;
 
 // ─────────────────────────────────────────────
 // HELPERS
@@ -659,12 +663,15 @@ function openCashfreePopup(paymentSessionId, orderId, paymentType, data, trigger
     paymentSessionId,
     redirectTarget: "_modal", // popup — NOT a full-page redirect
     onSuccess: () => {
-      // Popup reports success — wait for webhook confirmation via listener.
+      // Popup reports success — payment submitted. Set a flag so onClose knows
+      // NOT to treat this as a cancel (user paid but popup auto-dismissed).
+      _paymentSubmitted = true;
       updatePaymentLoadingMsg("Payment received. Verifying…");
     },
     onFailure: async (reason) => {
       // [U13] Release in-flight lock so user can try again without refreshing
       _paymentInFlight = false;
+      _paymentSubmitted = false;
       reEnableButton(triggerBtn);
       _clearActiveListener();
       cancelPaymentState(orderId); // marks cancelled so refresh skips the spinner
@@ -681,15 +688,24 @@ function openCashfreePopup(paymentSessionId, orderId, paymentType, data, trigger
       });
     },
     onClose: () => {
-      // User closed/cancelled the popup.
-      // Kill the Firestore listener immediately — we are NOT waiting for a
-      // webhook because no payment was submitted.
+      // Popup closed. Two cases:
+      //   A) User paid (onSuccess fired first) → _paymentSubmitted = true
+      //      Keep the listener alive — webhook is in-flight. Do NOT cancel.
+      //   B) User cancelled without paying → _paymentSubmitted = false
+      //      Kill the listener, release the slot, show cancelled UI.
+      if (_paymentSubmitted) {
+        // Payment was submitted — just update the overlay message and wait.
+        updatePaymentLoadingMsg("Payment submitted. Verifying booking…");
+        return;
+      }
+
+      // Genuine cancel — no payment submitted.
       _clearActiveListener();
       _paymentInFlight = false;
+      _paymentSubmitted = false;
       reEnableButton(triggerBtn);
 
-      // Mark as cancelled BEFORE touching the overlay so that if the user
-      // refreshes the recovery flow skips the spinner.
+      // Mark as cancelled so a page refresh skips the recovery spinner.
       cancelPaymentState(orderId);
 
       // Release the slot lock in the background (don't await — fire and forget)
@@ -760,7 +776,8 @@ async function startPayment(data, paymentType) {
     console.warn("⚠️ startPayment called while another payment is in flight — ignoring.");
     return;
   }
-  _paymentInFlight = true;
+  _paymentInFlight  = true;
+  _paymentSubmitted = false; // reset for this new payment attempt
 
   if (!currentUser) {
     _paymentInFlight = false;
@@ -1023,13 +1040,54 @@ function dispatchPaymentEvent(name, detail) {
 function recoverPaymentSession() {
   // ── GUARD 1: Previous session was explicitly cancelled/closed ────────────
   // cancelPaymentState() sets bmg_payCancelled when user dismisses the popup.
-  // On refresh we clear it silently — never show the spinner for a cancel.
+  // BUT: for UPI app-switch flows the popup fires onClose AFTER onSuccess.
+  // If the webhook already confirmed the booking, we must show success — not skip.
+  // So: if CANCELLED is set, still check the final collection before giving up.
   if (localStorage.getItem(LS.CANCELLED)) {
-    console.log("⚡ Previous payment was cancelled — skipping recovery.");
-    localStorage.removeItem(LS.CANCELLED); // one-shot: clear so it doesn't persist
-    // Also remove any stuck overlay immediately (2-second max)
-    removePaymentUI();
-    setTimeout(removePaymentUI, 2000); // belt-and-suspenders
+    const _cancelledOrderId = localStorage.getItem(LS.ORDER_ID);
+    const _cancelledPayType = localStorage.getItem(LS.PAY_TYPE);
+    localStorage.removeItem(LS.CANCELLED);
+
+    if (_cancelledOrderId && _cancelledPayType) {
+      // Quick-check: did the booking actually get confirmed despite the cancel flag?
+      (async () => {
+        try {
+          let result = null;
+          if (_cancelledPayType === "booking") {
+            const bSnap = await db.collection("bookings").doc(_cancelledOrderId).get();
+            if (bSnap.exists) result = bSnap.data();
+          } else if (_cancelledPayType === "tournament") {
+            const tSnap = await db.collection("tournament_entries").doc(_cancelledOrderId).get();
+            if (tSnap.exists) result = tSnap.data();
+          } else if (_cancelledPayType === "owner_onboarding") {
+            const oSnap = await db.collection("owner_payments").doc(_cancelledOrderId).get();
+            if (oSnap.exists) result = { orderId: _cancelledOrderId, paymentType: _cancelledPayType };
+          }
+          if (result) {
+            // Payment succeeded — show confirmation instead of silently dismissing.
+            clearPaymentState();
+            _paymentInFlight  = false;
+            _paymentSubmitted = false;
+            showPaymentSuccess(_cancelledPayType, _cancelledOrderId);
+            dispatchPaymentEvent("bmg:paymentConfirmed", {
+              orderId: _cancelledOrderId,
+              paymentType: _cancelledPayType,
+              result,
+            });
+          } else {
+            // Genuinely cancelled — clean up silently.
+            removePaymentUI();
+            clearPaymentState();
+          }
+        } catch(e) {
+          removePaymentUI();
+          clearPaymentState();
+        }
+      })();
+    } else {
+      removePaymentUI();
+      setTimeout(removePaymentUI, 2000);
+    }
     return;
   }
 
