@@ -861,12 +861,13 @@ async function startPayment(data, paymentType) {
         clearPaymentState();
         _paymentInFlight = false;
 
-        // Always release slot lock on timeout so slot is never stuck
-        await releaseSlotLock(orderId);
-
+        // FIX: Do NOT release slot lock on timeout. The payment may have
+        // succeeded on Cashfree's side — the webhook is simply delayed.
+        // Releasing the slot here risks double-booking a paid slot.
+        // The scheduled cleanup handles truly abandoned locks after 30 min.
         reEnableButton(triggerBtn);
         showToast(
-          "Verification is taking longer than usual. Check your booking history in a few minutes.",
+          "Verifying your payment… Check 'My Bookings' in a moment.",
           "warning",
           9000
         );
@@ -1121,8 +1122,10 @@ function recoverPaymentSession() {
         removePaymentUI();
         clearPaymentState();
         _paymentInFlight = false;
-        await releaseSlotLock(orderId);
-        showToast("Could not verify payment automatically. Check your booking history.", "warning", 8000);
+        // FIX: Do NOT release slot on timeout — payment may be confirmed on
+        // Cashfree's end with webhook just delayed. Scheduled cleanup handles
+        // truly abandoned locks after 30 minutes.
+        showToast("Could not verify payment automatically. Check 'My Bookings' — it may already be confirmed.", "warning", 8000);
       },
     });
   })();
