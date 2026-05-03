@@ -364,6 +364,7 @@ function listenForPaymentConfirmation(orderId, paymentType, callbacks) {
     async (snap) => {
       if (!snap.exists) {
         // Pending doc was deleted — webhook has fired (success or failure).
+        _stopSuccessPoller(); // backup poller no longer needed
         _clearActiveListener();
 
         try {
@@ -666,12 +667,18 @@ function openCashfreePopup(paymentSessionId, orderId, paymentType, data, trigger
       // Popup reports success — payment submitted. Set a flag so onClose knows
       // NOT to treat this as a cancel (user paid but popup auto-dismissed).
       _paymentSubmitted = true;
-      updatePaymentLoadingMsg("Payment received. Verifying…");
+      updatePaymentLoadingMsg("Payment received. Confirming booking…");
+
+      // Start an aggressive poll as a backup to the onSnapshot listener.
+      // Covers: websocket reconnection gaps, tab-backgrounding, brief network drops.
+      // Polls every 3 s for up to 90 s (matches LISTENER_TIMEOUT_MS).
+      _startSuccessPoller(orderId, paymentType);
     },
     onFailure: async (reason) => {
       // [U13] Release in-flight lock so user can try again without refreshing
       _paymentInFlight = false;
       _paymentSubmitted = false;
+      _stopSuccessPoller();
       reEnableButton(triggerBtn);
       _clearActiveListener();
       cancelPaymentState(orderId); // marks cancelled so refresh skips the spinner
@@ -700,6 +707,7 @@ function openCashfreePopup(paymentSessionId, orderId, paymentType, data, trigger
       }
 
       // Genuine cancel — no payment submitted.
+      _stopSuccessPoller();
       _clearActiveListener();
       _paymentInFlight = false;
       _paymentSubmitted = false;
@@ -757,6 +765,97 @@ function openCashfreePopup(paymentSessionId, orderId, paymentType, data, trigger
       }, 2000);
     }
   }, 500);
+}
+
+// ─────────────────────────────────────────────
+// BACKUP SUCCESS POLLER
+// Polls Firestore directly every 3 s after onSuccess fires.
+// This is a belt-and-suspenders backup to the onSnapshot listener —
+// it confirms the booking even if the websocket missed the deletion.
+// ─────────────────────────────────────────────
+let _successPollTimer = null;
+
+function _startSuccessPoller(orderId, paymentType) {
+  _stopSuccessPoller(); // never run two at once
+  let attempts = 0;
+  const MAX_ATTEMPTS = 30; // 30 × 3s = 90s max
+
+  _successPollTimer = setInterval(async () => {
+    attempts++;
+
+    try {
+      // Check if booking already confirmed in final collection
+      let confirmed = false;
+      if (paymentType === "booking") {
+        const snap = await db.collection("bookings").doc(orderId).get();
+        confirmed = snap.exists;
+      } else if (paymentType === "tournament") {
+        const snap = await db.collection("tournament_entries").doc(orderId).get();
+        confirmed = snap.exists;
+      } else if (paymentType === "owner_onboarding") {
+        const snap = await db.collection("owner_payments").doc(orderId).get();
+        confirmed = snap.exists;
+      }
+
+      if (confirmed) {
+        _stopSuccessPoller();
+        // onSnapshot will also fire — but we clear the listener first so
+        // onConfirmed is only called once (clearActiveListener is idempotent).
+        console.log("✅ [POLLER] Booking confirmed in Firestore:", orderId);
+        // The onSnapshot listener's onConfirmed handler will fire via the
+        // snapshot. If it already fired, _clearActiveListener is a no-op.
+        // Trigger directly here to be safe:
+        clearPaymentState();
+        _paymentInFlight  = false;
+        _paymentSubmitted = false;
+        _clearActiveListener();
+        showPaymentSuccess(paymentType, orderId);
+
+        // Fetch full booking data for the confirmation page
+        let result = { orderId, paymentType };
+        try {
+          if (paymentType === "booking") {
+            const snap = await db.collection("bookings").doc(orderId).get();
+            if (snap.exists) result = snap.data();
+          } else if (paymentType === "tournament") {
+            const snap = await db.collection("tournament_entries").doc(orderId).get();
+            if (snap.exists) result = snap.data();
+          }
+        } catch(e) { /* use minimal result */ }
+
+        dispatchPaymentEvent("bmg:paymentConfirmed", { orderId, paymentType, result });
+        return;
+      }
+
+      // Also check failed_payments
+      const failSnap = await db.collection("failed_payments").doc(orderId).get();
+      if (failSnap.exists) {
+        _stopSuccessPoller();
+        _clearActiveListener();
+        clearPaymentState();
+        _paymentInFlight  = false;
+        _paymentSubmitted = false;
+        showPaymentError(failSnap.data()?.failureReason || "Payment failed. Please try again.");
+        return;
+      }
+
+    } catch(e) {
+      console.warn("[POLLER] Firestore check error:", e);
+    }
+
+    if (attempts >= MAX_ATTEMPTS) {
+      _stopSuccessPoller();
+      // Let the onTimeout handler from listenForPaymentConfirmation take over
+      console.warn("[POLLER] Max attempts reached — falling back to timeout handler");
+    }
+  }, 3000); // poll every 3 seconds
+}
+
+function _stopSuccessPoller() {
+  if (_successPollTimer) {
+    clearInterval(_successPollTimer);
+    _successPollTimer = null;
+  }
 }
 
 // ─────────────────────────────────────────────
