@@ -135,7 +135,7 @@ async function showOwnerRegistrationPayment() {
     userName : String(currentUser.name  || owner.name  || ''),
     userEmail: String(currentUser.email || owner.email || ''),
     userPhone: String(currentUser.phone || owner.phone || ''),
-    amount   : 499, // always 499; server enforces this too
+    amount   : 5, // registration fee (₹5)
   };
   console.log('FINAL PAYMENT DATA:', ownerPaymentData); // debug log
 
