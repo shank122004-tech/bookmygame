@@ -157,7 +157,7 @@ function _buildPendingDoc(orderId, paymentType, data, cu) {
     };
   }
   if (paymentType === 'owner_onboarding') {
-    return { ...base, ownerId: data.ownerId || cu.uid, amount: 499 };
+    return { ...base, ownerId: data.ownerId || cu.uid, amount: 5 };
   }
   if (paymentType === 'tournament') {
     return {
@@ -456,7 +456,7 @@ window.recoverPaymentSession              = recoverPaymentSession;
           userName : String(cu.ownerName || cu.name || ownerData.ownerName || ownerData.name || ''),
           userEmail: String(cu.email  || ownerData.email  || ''),
           userPhone: String(cu.phone  || ownerData.phone  || ''),
-          amount   : 499,
+          amount   : 5, // registration fee
         };
         await startPayment(pd, 'owner_onboarding');
       } catch (err) {
@@ -771,46 +771,102 @@ window.recoverPaymentSession              = recoverPaymentSession;
       const fmt = typeof window.formatCurrency === 'function'
         ? window.formatCurrency
         : v => '₹' + (v||0).toFixed(2);
-      const COLLECTIONS   = window.COLLECTIONS   || {};
+      const COLLECTIONS    = window.COLLECTIONS    || {};
       const BOOKING_STATUS = window.BOOKING_STATUS || {};
 
       try {
-        const today     = new Date().toISOString().split('T')[0];
-        const weekAgo   = new Date(); weekAgo.setDate(weekAgo.getDate() - 7);
-        const weekStart = weekAgo.toISOString().split('T')[0];
-        const monthAgo  = new Date(); monthAgo.setMonth(monthAgo.getMonth() - 1);
+        const today      = new Date().toISOString().split('T')[0];
+        const weekAgo    = new Date(); weekAgo.setDate(weekAgo.getDate() - 7);
+        const weekStart  = weekAgo.toISOString().split('T')[0];
+        const monthAgo   = new Date(); monthAgo.setMonth(monthAgo.getMonth() - 1);
         const monthStart = monthAgo.toISOString().split('T')[0];
 
-        const snap = await db.collection(COLLECTIONS.BOOKINGS || 'bookings')
-          .where('ownerId', '==', cu.uid)
-          .where('bookingStatus', '==', BOOKING_STATUS.CONFIRMED || 'confirmed')
-          .orderBy('date', 'desc')
-          .get();
+        // ── Fetch bookings + tournament entries in parallel ──────────────
+        const [bookingSnap, tournamentSnap] = await Promise.all([
+          db.collection(COLLECTIONS.BOOKINGS || 'bookings')
+            .where('ownerId', '==', cu.uid)
+            .where('bookingStatus', '==', BOOKING_STATUS.CONFIRMED || 'confirmed')
+            .orderBy('date', 'desc')
+            .get(),
+          db.collection(COLLECTIONS.TOURNAMENTS || 'tournaments')
+            .where('ownerId', '==', cu.uid)
+            .get()
+            .catch(() => ({ docs: [], empty: true })),
+        ]);
 
-        let todayE = 0, weekE = 0, monthE = 0, totalE = 0;
+        // ── Booking earnings ─────────────────────────────────────────────
+        let bTodayE = 0, bWeekE = 0, bMonthE = 0, bTotalE = 0;
         const bookings = [];
-        snap.forEach(doc => {
-          const b = doc.data();
+        bookingSnap.forEach(doc => {
+          const b   = doc.data();
           const amt = b.ownerAmount || 0;
-          totalE += amt;
-          if (b.date === today)     todayE += amt;
-          if (b.date >= weekStart)  weekE  += amt;
-          if (b.date >= monthStart) monthE += amt;
+          bTotalE += amt;
+          if (b.date === today)     bTodayE += amt;
+          if (b.date >= weekStart)  bWeekE  += amt;
+          if (b.date >= monthStart) bMonthE += amt;
           bookings.push(b);
         });
 
-        // Transfers already sent by CEO
+        // ── Tournament earnings ──────────────────────────────────────────
+        // For each tournament owned by this owner, sum ownerAmount from
+        // confirmed tournament_entries (20% platform cut already applied).
+        let tTodayE = 0, tWeekE = 0, tMonthE = 0, tTotalE = 0;
+        const tournamentEarningRows = [];
+
+        if (!tournamentSnap.empty) {
+          const ownerTournamentIds = tournamentSnap.docs.map(d => d.id);
+
+          // Firestore 'in' query supports up to 30 items
+          const chunks = [];
+          for (let i = 0; i < ownerTournamentIds.length; i += 30) {
+            chunks.push(ownerTournamentIds.slice(i, i + 30));
+          }
+
+          for (const chunk of chunks) {
+            const tEntries = await db.collection('tournament_entries')
+              .where('tournamentId', 'in', chunk)
+              .get()
+              .catch(() => ({ docs: [] }));
+
+            tEntries.docs.forEach(doc => {
+              const e   = doc.data();
+              if (e.status !== 'confirmed' && e.paymentStatus !== 'paid') return;
+              const amt  = e.ownerAmount || Math.round((e.amount || 0) * 0.80); // 20% platform fee
+              const date = e.date || '';
+              tTotalE += amt;
+              if (date === today)     tTodayE += amt;
+              if (date >= weekStart)  tWeekE  += amt;
+              if (date >= monthStart) tMonthE += amt;
+              tournamentEarningRows.push({
+                name       : e.tournamentName || 'Tournament',
+                teamName   : e.teamName       || '',
+                date       : date,
+                amount     : e.amount         || 0,
+                ownerAmount: amt,
+                id         : doc.id,
+              });
+            });
+          }
+        }
+
+        const totalE  = bTotalE  + tTotalE;
+        const todayE  = bTodayE  + tTodayE;
+        const weekE   = bWeekE   + tWeekE;
+        const monthE  = bMonthE  + tMonthE;
+
+        // ── Transfers already sent by CEO ────────────────────────────────
         const tSnap = await db.collection('owner_transfers')
           .where('ownerId', '==', cu.uid)
           .orderBy('createdAt', 'desc')
-          .get().catch(() => ({ docs: [], empty: true }));
+          .get().catch(() => ({ docs: [] }));
         let totalSent = 0;
         const transfers = [];
         tSnap.docs.forEach(d => { totalSent += d.data().amount || 0; transfers.push({ id: d.id, ...d.data() }); });
 
-        const pending = Math.max(0, totalE - totalSent);
+        const pendingBalance = Math.max(0, totalE - totalSent);
 
-        const bookingRows = bookings.slice(0, 40).map(b => `
+        // ── Build booking rows ────────────────────────────────────────────
+        const bookingRows = bookings.slice(0, 30).map(b => `
           <div style="display:flex;justify-content:space-between;align-items:center;padding:12px 0;border-bottom:1px solid var(--gray-100,#f3f4f6);">
             <div>
               <div style="font-weight:600;font-size:14px;">${_esc(b.groundName || 'Ground Booking')}</div>
@@ -823,6 +879,21 @@ window.recoverPaymentSession              = recoverPaymentSession;
             </div>
           </div>`).join('');
 
+        // ── Build tournament rows ─────────────────────────────────────────
+        const tRows = tournamentEarningRows.slice(0, 20).map(t => `
+          <div style="display:flex;justify-content:space-between;align-items:center;padding:12px 0;border-bottom:1px solid var(--gray-100,#f3f4f6);">
+            <div>
+              <div style="font-weight:600;font-size:14px;">${_esc(t.name)}</div>
+              <div style="font-size:12px;color:var(--gray-500);">${t.date}${t.teamName ? ' • Team: '+_esc(t.teamName) : ''}</div>
+              <div style="font-size:11px;color:#7c3aed;">Entry: ${fmt(t.amount)} → Your share (80%)</div>
+            </div>
+            <div style="text-align:right;">
+              <div style="font-weight:700;color:#7c3aed;font-size:16px;">${fmt(t.ownerAmount)}</div>
+              <div style="font-size:11px;color:var(--gray-400);">tournament</div>
+            </div>
+          </div>`).join('');
+
+        // ── Transfer history rows ─────────────────────────────────────────
         const transferRows = transfers.slice(0, 10).map(t => {
           const date = t.createdAt?.toDate ? t.createdAt.toDate().toLocaleDateString('en-IN') : 'N/A';
           return `
@@ -835,7 +906,9 @@ window.recoverPaymentSession              = recoverPaymentSession;
           </div>`;
         }).join('');
 
+        // ── Render ────────────────────────────────────────────────────────
         container.innerHTML = `
+          <!-- SUMMARY STATS -->
           <div class="stats-grid">
             <div class="stat-card"><div class="stat-value">${fmt(todayE)}</div><div class="stat-label">Today</div></div>
             <div class="stat-card"><div class="stat-value">${fmt(weekE)}</div><div class="stat-label">This Week</div></div>
@@ -843,12 +916,13 @@ window.recoverPaymentSession              = recoverPaymentSession;
             <div class="stat-card"><div class="stat-value">${fmt(totalE)}</div><div class="stat-label">Total Earned</div></div>
           </div>
 
-          <div style="background:var(--gradient-primary,linear-gradient(135deg,#6366f1,#8b5cf6));border-radius:16px;padding:20px;margin-bottom:20px;color:#fff;">
+          <!-- BALANCE CARD -->
+          <div style="background:linear-gradient(135deg,#1b2e6c,#2563eb);border-radius:16px;padding:20px;margin-bottom:20px;color:#fff;">
             <div style="display:flex;justify-content:space-between;align-items:center;">
               <div>
                 <div style="font-size:13px;opacity:.85;margin-bottom:4px;"><i class="fas fa-wallet"></i> Balance to Receive</div>
-                <div style="font-size:28px;font-weight:700;">${fmt(pending)}</div>
-                <div style="font-size:11px;opacity:.75;margin-top:4px;">After 10% platform fee</div>
+                <div style="font-size:28px;font-weight:700;">${fmt(pendingBalance)}</div>
+                <div style="font-size:11px;opacity:.75;margin-top:4px;">Bookings + Tournaments (after platform fee)</div>
               </div>
               <i class="fas fa-money-bill-wave" style="font-size:36px;opacity:.3;"></i>
             </div>
@@ -857,17 +931,25 @@ window.recoverPaymentSession              = recoverPaymentSession;
             </div>
           </div>
 
-          <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:20px;">
-            <div style="background:var(--bg-secondary,#f9fafb);border-radius:12px;padding:14px;text-align:center;">
-              <div style="font-size:11px;color:var(--gray-500);">Already Received</div>
-              <div style="font-size:18px;font-weight:700;color:var(--success,#10b981);">${fmt(totalSent)}</div>
+          <!-- BREAKDOWN: Bookings vs Tournaments -->
+          <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:20px;">
+            <div style="background:var(--bg-secondary,#f9fafb);border-radius:12px;padding:14px;text-align:center;border:1px solid #e5e7eb;">
+              <div style="font-size:10px;color:var(--gray-500);margin-bottom:4px;">Booking Earnings</div>
+              <div style="font-size:16px;font-weight:700;color:#10b981;">${fmt(bTotalE)}</div>
+              <div style="font-size:10px;color:var(--gray-400);">${bookings.length} bookings</div>
             </div>
-            <div style="background:var(--bg-secondary,#f9fafb);border-radius:12px;padding:14px;text-align:center;">
-              <div style="font-size:11px;color:var(--gray-500);">Total Bookings</div>
-              <div style="font-size:18px;font-weight:700;color:var(--primary,#6366f1);">${bookings.length}</div>
+            <div style="background:var(--bg-secondary,#f9fafb);border-radius:12px;padding:14px;text-align:center;border:1px solid #e5e7eb;">
+              <div style="font-size:10px;color:var(--gray-500);margin-bottom:4px;">Tournament Earnings</div>
+              <div style="font-size:16px;font-weight:700;color:#7c3aed;">${fmt(tTotalE)}</div>
+              <div style="font-size:10px;color:var(--gray-400);">${tournamentEarningRows.length} entries</div>
+            </div>
+            <div style="background:var(--bg-secondary,#f9fafb);border-radius:12px;padding:14px;text-align:center;border:1px solid #e5e7eb;">
+              <div style="font-size:10px;color:var(--gray-500);margin-bottom:4px;">Already Received</div>
+              <div style="font-size:16px;font-weight:700;color:#2563eb;">${fmt(totalSent)}</div>
             </div>
           </div>
 
+          <!-- TRANSFER HISTORY -->
           ${transfers.length > 0 ? `
           <div style="margin-bottom:20px;">
             <div style="font-weight:700;font-size:15px;margin-bottom:12px;">
@@ -876,14 +958,26 @@ window.recoverPaymentSession              = recoverPaymentSession;
             ${transferRows}
           </div>` : ''}
 
-          <div>
+          <!-- BOOKING HISTORY -->
+          <div style="margin-bottom:20px;">
             <div style="font-weight:700;font-size:15px;margin-bottom:12px;">
-              <i class="fas fa-history" style="color:var(--primary,#6366f1);"></i> Earnings History
+              <i class="fas fa-calendar-check" style="color:#10b981;"></i> Ground Booking Earnings
               <span style="font-weight:400;font-size:12px;color:var(--gray-500);margin-left:8px;">(${bookings.length} bookings)</span>
             </div>
             ${bookings.length === 0
-              ? '<div style="text-align:center;padding:32px;color:var(--gray-400);">No bookings yet</div>'
+              ? '<div style="text-align:center;padding:24px;color:var(--gray-400);">No ground bookings yet</div>'
               : bookingRows}
+          </div>
+
+          <!-- TOURNAMENT EARNINGS HISTORY -->
+          <div>
+            <div style="font-weight:700;font-size:15px;margin-bottom:12px;">
+              <i class="fas fa-trophy" style="color:#7c3aed;"></i> Tournament Earnings
+              <span style="font-weight:400;font-size:12px;color:var(--gray-500);margin-left:8px;">(${tournamentEarningRows.length} entries)</span>
+            </div>
+            ${tournamentEarningRows.length === 0
+              ? '<div style="text-align:center;padding:24px;color:var(--gray-400);">No tournament earnings yet</div>'
+              : tRows}
           </div>`;
 
         _bmgHideLoading();
@@ -939,11 +1033,22 @@ window.recoverPaymentSession              = recoverPaymentSession;
           sentMap[oid] = ts.docs.reduce((s,d) => s + (d.data().amount||0), 0);
         }));
 
-        // Platform revenue
+        // Platform revenue: booking commissions + tournament platform fees
         let platformRev = 0;
         bookingsSnap.forEach(doc => {
           platformRev += doc.data().commission || (doc.data().amount * 0.1) || 0;
         });
+        // Also add tournament platform fees (20% of each entry fee)
+        // Fetch all tournament_entries for owner's tournaments
+        const ownerTourneyIds = ownersSnap.docs.map(d => d.id);
+        if (ownerTourneyIds.length > 0) {
+          const tChunks = [];
+          for (let i = 0; i < ownerTourneyIds.length; i += 30) tChunks.push(ownerTourneyIds.slice(i, i+30));
+          for (const chunk of tChunks) {
+            const tE = await db.collection('tournament_entries').where('tournamentId', 'in', chunk).get().catch(()=>({docs:[]}));
+            tE.docs.forEach(d => { const e = d.data(); platformRev += (e.platformFee || Math.round((e.amount||0)*0.20)); });
+          }
+        }
 
         const ownerRows = Object.entries(ownerMap).map(([oid, info]) => {
           const sent    = sentMap[oid] || 0;
@@ -954,7 +1059,7 @@ window.recoverPaymentSession              = recoverPaymentSession;
                 <div>
                   <div style="font-weight:700;font-size:15px;">${_esc(info.name)}</div>
                   <div style="font-size:12px;color:var(--gray-500);">${_esc(info.phone)}${info.upi ? ' • UPI: '+_esc(info.upi) : ''}</div>
-                  <div style="font-size:12px;color:var(--gray-500);">${info.bookings.length} booking(s)</div>
+                  <div style="font-size:12px;color:var(--gray-500);">${info.bookings.length} ground booking(s)</div>
                 </div>
                 <div style="text-align:right;">
                   <div style="font-size:11px;color:var(--gray-500);">Total Earned</div>
@@ -984,9 +1089,9 @@ window.recoverPaymentSession              = recoverPaymentSession;
 
         container.innerHTML = `
           <div style="background:var(--gradient-primary,linear-gradient(135deg,#6366f1,#8b5cf6));border-radius:16px;padding:20px;margin-bottom:20px;color:#fff;">
-            <div style="font-size:13px;opacity:.85;margin-bottom:4px;"><i class="fas fa-chart-line"></i> Platform Revenue (10% Commission)</div>
+            <div style="font-size:13px;opacity:.85;margin-bottom:4px;"><i class="fas fa-chart-line"></i> Platform Revenue (Bookings 10% + Tournaments 20%)</div>
             <div style="font-size:32px;font-weight:700;">${fmt(platformRev)}</div>
-            <div style="font-size:12px;opacity:.75;margin-top:4px;">From all confirmed bookings</div>
+            <div style="font-size:12px;opacity:.75;margin-top:4px;">From all confirmed bookings &amp; tournament registrations</div>
           </div>
           <div style="font-weight:700;font-size:16px;margin-bottom:16px;">
             <i class="fas fa-users" style="color:var(--primary,#6366f1);"></i> Owner Earnings &amp; Transfers
