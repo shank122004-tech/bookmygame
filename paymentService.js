@@ -764,7 +764,7 @@ window.recoverPaymentSession              = recoverPaymentSession;
    *  [N5]  Owner Earnings — real data, no payout system
    * ─────────────────────────────────────────────────────────────────*/
   function patchOwnerEarnings() {
-    window.loadOwnerEarnings = async function (container) {
+    const _earningsFn = async function (container) {
       _bmgShowLoading('Loading earnings…');
       const db = window.db;
       const cu = window.currentUser;
@@ -986,6 +986,8 @@ window.recoverPaymentSession              = recoverPaymentSession;
         container.innerHTML = `<p style="text-align:center;color:red;">Failed to load: ${err.message}</p>`;
       }
     };
+    window.loadOwnerEarnings        = _earningsFn;
+    window._bmgLoadOwnerEarningsFull = _earningsFn;
   }
 
   /* ─────────────────────────────────────────────────────────────────
@@ -1563,6 +1565,69 @@ window.recoverPaymentSession              = recoverPaymentSession;
   window._esc = _esc;
 
   /* ─────────────────────────────────────────────────────────────────
+   *  [N7]  Page-load payment recovery
+   *  Checks Firestore for any recently-confirmed tournament or
+   *  owner_onboarding payment for the current user and fires the
+   *  bmg:paymentConfirmed event so the UI shows the success screen.
+   *  This handles the case where Cashfree redirects the browser and
+   *  session-storage / in-memory state is lost.
+   * ─────────────────────────────────────────────────────────────────*/
+  async function _recoverPendingPaymentsOnLoad() {
+    // Wait for auth to settle (currentUser set by app.js)
+    let waited = 0;
+    while (!window.currentUser && waited < 5000) {
+      await new Promise(r => setTimeout(r, 300));
+      waited += 300;
+    }
+    const cu = window.currentUser;
+    if (!cu || !window.db) return;
+    const db = window.db;
+
+    try {
+      // ── Check sessionStorage for a pending orderId ──────────────────
+      let orderId    = sessionStorage.getItem('bmg_recoverOrderId');
+      let payType    = sessionStorage.getItem('bmg_recoverPayType');
+
+      // If not in sessionStorage, scan pending_payments for this user
+      if (!orderId) {
+        const snap = await db.collection('pending_payments')
+          .where('userId', '==', cu.uid)
+          .orderBy('createdAt', 'desc')
+          .limit(5)
+          .get().catch(() => null);
+        if (snap && !snap.empty) {
+          const recent = snap.docs[0];
+          const age = Date.now() - (recent.data().createdAt?.toMillis?.() || 0);
+          // Only recover if less than 30 minutes old
+          if (age < 30 * 60 * 1000) {
+            orderId = recent.id;
+            payType = recent.data().paymentType;
+          }
+        }
+      }
+
+      if (!orderId) return;
+
+      // ── Check if already confirmed ──────────────────────────────────
+      const result = await _checkFinalStatus(orderId, payType);
+      if (result.success) {
+        console.log('[paymentService] [N7] Recovered confirmed payment on load:', payType, orderId);
+        sessionStorage.removeItem('bmg_recoverOrderId');
+        sessionStorage.removeItem('bmg_recoverPayType');
+        _handlePaymentSuccess(orderId, payType, result.data);
+        return;
+      }
+
+      // Not yet confirmed — start polling silently
+      if (!result.failed) {
+        await recoverPaymentSession(orderId, payType, {});
+      }
+    } catch (e) {
+      console.warn('[paymentService] [N7] Recovery error:', e);
+    }
+  }
+
+  /* ─────────────────────────────────────────────────────────────────
    *  BOOT — Apply all patches in correct order
    * ─────────────────────────────────────────────────────────────────*/
 
@@ -1581,6 +1646,10 @@ window.recoverPaymentSession              = recoverPaymentSession;
     patchQRScannerUI();             // [F6]
     patchOwnerDashboardTabs();      // [F7]
     patchModalStepVariables();      // [F8 + N2 + N4] — MUST BE LAST (wraps original fns)
+
+    // [N7] Page-load payment recovery — catches post-redirect scenarios
+    _recoverPendingPaymentsOnLoad();
+
     console.log('✅ paymentService.js v3 — all features + fixes loaded');
   });
 
