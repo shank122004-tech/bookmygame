@@ -41,21 +41,13 @@
    * ═══════════════════════════════════════════════════════════════ */
 
   /**
-   * Generate a signed QR payload.
-   * Owners scan this and the scanner verifies against Firestore.
+   * Generate a compact QR payload.
+   * Format: "BMG|<bookingId>"  — always < 60 chars, never overflows any QR version.
+   * The owner scanner looks up full booking details from Firestore using bookingId.
    */
   function buildQRPayload(booking) {
-    return JSON.stringify({
-      app     : 'BookMyGame',
-      v       : 2,                        // version
-      bid     : booking.bookingId,
-      gid     : booking.groundId,
-      uid     : booking.userId || '',
-      date    : booking.date,
-      slot    : booking.slotTime,
-      amount  : booking.amount,
-      name    : booking.userName || '',
-    });
+    // Compact: just the booking ID prefixed so scanner recognises it as ours.
+    return 'BMG|' + (booking.bookingId || booking.id || '');
   }
 
   /**
@@ -113,28 +105,46 @@
         }
 
         // ── Build QR ────────────────────────────────────────────
+        // Compact payload: "BMG|<bookingId>" — never more than ~60 chars
         const qrPayload = buildQRPayload(booking);
         let qrDataUrl = '';
 
-        // Try multiple QR libraries loaded by index.html
-        if (typeof QRCode !== 'undefined' && QRCode.toDataURL) {
-          qrDataUrl = await QRCode.toDataURL(qrPayload, { width: 220, margin: 2 });
-        } else if (typeof window.QRCode === 'function') {
-          // qrcodejs library — uses a DOM node
+        // PRIORITY 1: qrcode@1.5.1 toDataURL API (Promise-based, reliable)
+        if (typeof QRCode !== 'undefined' && typeof QRCode.toDataURL === 'function') {
+          try {
+            qrDataUrl = await QRCode.toDataURL(qrPayload, {
+              width: 220,
+              margin: 2,
+              errorCorrectionLevel: 'M',
+            });
+          } catch (qrErr) {
+            console.warn('[BMG Fix v4] QRCode.toDataURL failed:', qrErr);
+            qrDataUrl = '';
+          }
+        }
+
+        // PRIORITY 2: qrcodejs (DOM constructor) — compact payload, never overflows
+        if (!qrDataUrl && typeof window.QRCode === 'function') {
           await new Promise((resolve) => {
             const tmp = document.createElement('div');
+            tmp.style.cssText = 'position:absolute;left:-9999px;top:-9999px;';
             document.body.appendChild(tmp);
-            const qr = new window.QRCode(tmp, {
-              text  : qrPayload,
-              width : 220,
-              height: 220,
-            });
+            try {
+              new window.QRCode(tmp, {
+                text  : qrPayload,
+                width : 220,
+                height: 220,
+                correctLevel: (window.QRCode.CorrectLevel && window.QRCode.CorrectLevel.M) || 1,
+              });
+            } catch (qrErr) {
+              console.warn('[BMG Fix v4] qrcodejs failed:', qrErr);
+            }
             setTimeout(() => {
               const img = tmp.querySelector('img');
-              if (img) qrDataUrl = img.src;
-              document.body.removeChild(tmp);
+              if (img && img.src) qrDataUrl = img.src;
+              try { document.body.removeChild(tmp); } catch (_) {}
               resolve();
-            }, 300);
+            }, 400);
           });
         }
 
@@ -284,9 +294,11 @@
       if (!booking) return;
 
       let qrDataUrl = '';
-      const payload = buildQRPayload(booking);
-      if (typeof QRCode !== 'undefined' && QRCode.toDataURL) {
-        qrDataUrl = await QRCode.toDataURL(payload, { width: 160, margin: 1 });
+      const payload = buildQRPayload(booking); // compact "BMG|<id>" — no overflow
+      if (typeof QRCode !== 'undefined' && typeof QRCode.toDataURL === 'function') {
+        try {
+          qrDataUrl = await QRCode.toDataURL(payload, { width: 160, margin: 1, errorCorrectionLevel: 'M' });
+        } catch (_) {}
       }
 
       _injectPassOnConfirmation(booking, qrDataUrl);
@@ -304,10 +316,23 @@
    * After payment confirmed for a booking, immediately mark that slot
    * as booked in the UI without waiting for a Firestore refresh.
    */
-  window.addEventListener('bmg:paymentConfirmed', function (e) {
-    const { paymentType, result } = e.detail || {};
+  window.addEventListener('bmg:paymentConfirmed', async function (e) {
+    const { paymentType, result, orderId } = e.detail || {};
     if (paymentType !== 'booking') return;
 
+    // ── Show entry pass INSTANTLY ─────────────────────────────────
+    const bookingId = (result && result.bookingId) || orderId;
+    if (bookingId) {
+      // Small delay so Firestore webhook write can settle (1.2s)
+      setTimeout(async () => {
+        if (typeof window.showEntryPass === 'function') {
+          console.log('[BMG Fix v4] Auto-showing entry pass for', bookingId);
+          window.showEntryPass(bookingId);
+        }
+      }, 1200);
+    }
+
+    // ── Mark slot red in UI ───────────────────────────────────────
     const booking = result || {};
     const groundId = booking.groundId;
     const date     = booking.date;
@@ -315,7 +340,6 @@
 
     if (!groundId || !date || !slotTime) return;
 
-    // Wait a tiny bit for the DOM to be on the ground/slot page
     setTimeout(() => _markSlotBooked(groundId, date, slotTime), 200);
     setTimeout(() => _markSlotBooked(groundId, date, slotTime), 800);
   });
@@ -417,8 +441,27 @@
     if (typeof _orig !== 'function') return;
 
     window.handleUserRegister = async function (e) {
-      // Run original
-      await _orig.call(this, e);
+      if (e && e.preventDefault) e.preventDefault();
+
+      // Retry wrapper — Firestore auth token may not have propagated yet
+      let lastErr = null;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          await _orig.call(this, e);
+          lastErr = null;
+          break; // success
+        } catch (err) {
+          lastErr = err;
+          const isPermission = err?.code === 'permission-denied' ||
+                               String(err?.message || '').toLowerCase().includes('permission');
+          if (isPermission && attempt < 3) {
+            console.warn('[BMG Fix v4] Registration permission error attempt', attempt, '— retrying in 1.2s');
+            await new Promise(r => setTimeout(r, 1200));
+            continue;
+          }
+          throw err; // non-permission error or final attempt — rethrow
+        }
+      }
 
       // After original runs, save city if provided
       const cityInput = document.getElementById('reg-city');
@@ -429,6 +472,8 @@
         const auth = window.auth || window.firebase?.auth?.();
         const user = auth?.currentUser;
         if (user) {
+          // Wait briefly for Firestore auth to propagate before updating
+          await new Promise(r => setTimeout(r, 600));
           await window.db.collection('users').doc(user.uid).update({
             city    : city,
             cityLower: city.toLowerCase(),
@@ -804,24 +849,39 @@
 
     window.processQRScanResult = window.handleQRScanResult = window.processQRResult =
     async function (qrText) {
+      if (!qrText) return;
+      qrText = qrText.trim();
+
+      // ── NEW compact format: "BMG|<bookingId>" ──────────────────
+      if (qrText.startsWith('BMG|')) {
+        const bid = qrText.slice(4);
+        if (bid) { await _verifyBookingQR({ bid }); return; }
+      }
+
+      // ── Legacy plain booking-ID string ─────────────────────────
+      if (qrText.startsWith('BMG_BOOKING_') || qrText.startsWith('BK_')) {
+        await _verifyBookingQR({ bid: qrText });
+        return;
+      }
+
       let parsed = null;
       try {
         parsed = JSON.parse(qrText);
       } catch (_) {
-        // Not JSON — could be old format
+        // Not JSON — pass to original handler or show error
         if (_origProcess) return _origProcess(qrText);
         if (typeof window.showToast === 'function')
           window.showToast('Invalid QR code format', 'error');
         return;
       }
 
-      // v2 format
+      // v2 JSON format (legacy, before compact switch)
       if (parsed.v === 2 && parsed.bid) {
         await _verifyBookingQR(parsed);
         return;
       }
 
-      // v1 / old format fallback
+      // v1 / old JSON format fallback
       if (parsed.bookingId || parsed.bid) {
         const bid = parsed.bookingId || parsed.bid;
         await _verifyBookingQR({ bid, ...parsed });
