@@ -2084,6 +2084,8 @@ console.log('✅ SpörtoBook Complete Fix v1.0 loaded successfully!');
     '#pay-owner-reg-fee-btn',
     '#pay-registration-now',
     '#complete-registration-btn',
+    '#owner-verification-status',   // "Owner Registration Status" card on profile page
+    '.owner-verification-status',
   ];
 
   function hideBanners() {
@@ -2146,23 +2148,7 @@ console.log('✅ SpörtoBook Complete Fix v1.0 loaded successfully!');
       if (typeof _origUpdate === 'function') {
         try { _origUpdate(); } catch (_) {}
       }
-      // Then forcibly override the status labels
-      var paySpan     = document.getElementById('owner-payment-status');
-      var groundsSpan = document.getElementById('grounds-listing-status');
-      var regBtn      = document.getElementById('complete-registration-btn');
-
-      if (paySpan) {
-        paySpan.textContent = 'Free ✓';
-        paySpan.className   = 'status-value paid';
-      }
-      if (groundsSpan) {
-        groundsSpan.textContent = 'Active';
-        groundsSpan.className   = 'status-value active';
-      }
-      if (regBtn) {
-        regBtn.style.setProperty('display', 'none', 'important');
-      }
-
+      // Hide the entire "Owner Registration Status" card — not needed
       hideBanners();
     };
     console.log('[free-listing] updateOwnerRegistrationStatus patched ✅');
